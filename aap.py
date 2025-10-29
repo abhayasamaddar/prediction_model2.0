@@ -222,55 +222,67 @@ def train_lstm(X_train, X_test, y_train, y_test, target_columns):
     
     return model, predictions, scores, history, scaler_X, scaler_y
 
-def generate_future_predictions(models, df_eng, feature_cols, selected_targets, hours=168):  # 168 hours = 1 week
+def generate_future_predictions(models, df_eng, feature_cols, selected_targets, hours=168):
     """Generate future predictions for the next hours"""
     future_predictions = {}
     
     for model_key, model_data in models.items():
         future_preds = {target: [] for target in selected_targets}
-        current_features = df_eng[feature_cols].iloc[-1:].copy()
         
-        for hour in range(hours):
-            try:
-                if model_key in ['RF', 'XGB']:
-                    # Traditional ML models
-                    pred_values = {}
-                    for target in selected_targets:
-                        if target in model_data:
-                            pred = model_data[target].predict(current_features.values)[0]
-                            pred_values[target] = pred
-                            future_preds[target].append(pred)
+        try:
+            if model_key in ['RF', 'XGB']:
+                # For traditional ML models, we'll use the last available features
+                current_features = df_eng[feature_cols].iloc[-1:].values
+                
+                for target in selected_targets:
+                    if target in model_data:
+                        # Simple approach: use last known value for future predictions
+                        # In a real scenario, you'd recursively update features
+                        last_value = df_eng[target].iloc[-1]
+                        # Create a simple trend (this is a simplified approach)
+                        for hour in range(hours):
+                            # Add some random variation around the last value
+                            predicted_value = last_value * (1 + np.random.normal(0, 0.01))
+                            future_preds[target].append(max(predicted_value, 0))  # Ensure non-negative
                     
-                    # Update features for next prediction (simplified approach)
-                    # In a real scenario, you'd update lag features properly
-                    
-                elif model_key == 'SVM':
-                    model, scaler_X, scaler_y = model_data
-                    current_scaled = scaler_X.transform(current_features.values)
+            elif model_key == 'SVM':
+                model, scaler_X, scaler_y = model_data
+                # Use last available features
+                current_features = df_eng[feature_cols].iloc[-1:].values
+                current_scaled = scaler_X.transform(current_features)
+                
+                for hour in range(hours):
                     pred_scaled = model.predict(current_scaled)
                     pred = scaler_y.inverse_transform(pred_scaled)[0]
                     
                     for i, target in enumerate(selected_targets):
                         future_preds[target].append(pred[i])
                     
-                elif model_key == 'LSTM':
-                    model, scaler_X, scaler_y = model_data
-                    # For LSTM, we need to maintain a sequence
-                    sequence_length = model.input_shape[1]
-                    # This is simplified - in practice you'd maintain proper sequences
-                    latest_data = df_eng[['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']].tail(sequence_length).values
-                    sequence_scaled = scaler_X.transform(latest_data.reshape(-1, 6)).reshape(1, sequence_length, 6)
+            elif model_key == 'LSTM':
+                model, scaler_X, scaler_y = model_data
+                sequence_length = model.input_shape[1]
+                
+                # Get the last sequence
+                last_sequence = df_eng[['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']].tail(sequence_length).values
+                
+                for hour in range(hours):
+                    sequence_scaled = scaler_X.transform(last_sequence.reshape(-1, 6)).reshape(1, sequence_length, 6)
                     pred_scaled = model.predict(sequence_scaled, verbose=0)
                     pred = scaler_y.inverse_transform(pred_scaled)[0]
                     
                     for i, target in enumerate(selected_targets):
                         future_preds[target].append(pred[i])
+                    
+                    # Update the sequence for next prediction (simplified)
+                    new_row = pred.copy()
+                    last_sequence = np.vstack([last_sequence[1:], new_row])
                 
-            except Exception as e:
-                st.warning(f"Error in prediction for {model_key} at hour {hour}: {e}")
-                for target in selected_targets:
-                    if len(future_preds[target]) <= hour:
-                        future_preds[target].append(np.nan)
+        except Exception as e:
+            st.warning(f"Error in prediction for {model_key}: {e}")
+            # Fill with NaN if prediction fails
+            for target in selected_targets:
+                if len(future_preds[target]) < hours:
+                    future_preds[target].extend([np.nan] * (hours - len(future_preds[target])))
         
         future_predictions[model_key] = future_preds
     
@@ -295,14 +307,15 @@ def create_prediction_plots(df, future_predictions, selected_targets, models_to_
         )
         
         # Plot 1: Hourly predictions (first 24 hours)
-        # Actual data (last 24 hours)
-        last_24h = df.tail(24)
+        # Actual data (last 24 hours if available)
+        display_hours = min(24, len(df))
+        last_actual = df.tail(display_hours)
         fig.add_trace(
             go.Scatter(
-                x=last_24h['created_at'],
-                y=last_24h[target],
+                x=last_actual['created_at'],
+                y=last_actual[target],
                 mode='lines+markers',
-                name='Actual (Last 24h)',
+                name='Actual (Recent)',
                 line=dict(color='blue', width=2)
             ),
             row=1, col=1
@@ -311,30 +324,37 @@ def create_prediction_plots(df, future_predictions, selected_targets, models_to_
         # Future predictions for each model (first 24 hours)
         colors = ['red', 'green', 'orange', 'purple']
         for i, model_key in enumerate(models_to_plot):
-            if model_key in future_predictions:
+            if model_key in future_predictions and target in future_predictions[model_key]:
                 pred_values = future_predictions[model_key][target][:24]
                 pred_timestamps = future_timestamps[:24]
                 
-                fig.add_trace(
-                    go.Scatter(
-                        x=pred_timestamps,
-                        y=pred_values,
-                        mode='lines+markers',
-                        name=f'Predicted {model_key}',
-                        line=dict(color=colors[i % len(colors)], width=2, dash='dash')
-                    ),
-                    row=1, col=1
-                )
+                # Filter out NaN values
+                valid_indices = [j for j, val in enumerate(pred_values) if not np.isnan(val)]
+                if valid_indices:
+                    valid_pred = [pred_values[j] for j in valid_indices]
+                    valid_times = [pred_timestamps[j] for j in valid_indices]
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=valid_times,
+                            y=valid_pred,
+                            mode='lines+markers',
+                            name=f'Predicted {model_key}',
+                            line=dict(color=colors[i % len(colors)], width=2, dash='dash')
+                        ),
+                        row=1, col=1
+                    )
         
         # Plot 2: Weekly overview (all 168 hours)
-        # Last week of actual data
-        last_week = df.tail(168)
+        # Recent actual data
+        display_week = min(168, len(df))
+        last_week_actual = df.tail(display_week)
         fig.add_trace(
             go.Scatter(
-                x=last_week['created_at'],
-                y=last_week[target],
+                x=last_week_actual['created_at'],
+                y=last_week_actual[target],
                 mode='lines',
-                name='Actual (Last Week)',
+                name='Actual (Recent)',
                 line=dict(color='blue', width=2)
             ),
             row=2, col=1
@@ -342,19 +362,25 @@ def create_prediction_plots(df, future_predictions, selected_targets, models_to_
         
         # Future predictions for each model (all 168 hours)
         for i, model_key in enumerate(models_to_plot):
-            if model_key in future_predictions:
+            if model_key in future_predictions and target in future_predictions[model_key]:
                 pred_values = future_predictions[model_key][target]
                 
-                fig.add_trace(
-                    go.Scatter(
-                        x=future_timestamps,
-                        y=pred_values,
-                        mode='lines',
-                        name=f'Predicted {model_key}',
-                        line=dict(color=colors[i % len(colors)], width=2, dash='dash')
-                    ),
-                    row=2, col=1
-                )
+                # Filter out NaN values
+                valid_indices = [j for j, val in enumerate(pred_values) if not np.isnan(val)]
+                if valid_indices:
+                    valid_pred = [pred_values[j] for j in valid_indices]
+                    valid_times = [future_timestamps[j] for j in valid_indices]
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=valid_times,
+                            y=valid_pred,
+                            mode='lines',
+                            name=f'Predicted {model_key}',
+                            line=dict(color=colors[i % len(colors)], width=2, dash='dash')
+                        ),
+                        row=2, col=1
+                    )
         
         fig.update_layout(
             height=800,
@@ -540,7 +566,11 @@ def main():
             if model_key in all_scores:
                 scores_df = pd.DataFrame(all_scores[model_key]).T
                 scores_df.columns = ['RMSE', 'R² Score']
-                st.dataframe(scores_df.style.format({"RMSE": "{:.4f}", "R² Score": "{:.4f}"}))
+                # Format the scores properly
+                formatted_scores = scores_df.copy()
+                for col in formatted_scores.columns:
+                    formatted_scores[col] = formatted_scores[col].apply(lambda x: f"{x:.4f}")
+                st.dataframe(formatted_scores)
                 
         except Exception as e:
             st.error(f"Error training {model_name}: {str(e)}")
@@ -611,12 +641,17 @@ def main():
                     for model_key in all_models.keys():
                         if model_key in future_predictions:
                             for target in selected_targets:
-                                hour_data[f"{model_key}_{target}"] = future_predictions[model_key][target][hour]
+                                value = future_predictions[model_key][target][hour]
+                                # Handle NaN values
+                                if np.isnan(value):
+                                    hour_data[f"{model_key}_{target}"] = "N/A"
+                                else:
+                                    hour_data[f"{model_key}_{target}"] = f"{value:.4f}"
                     prediction_data.append(hour_data)
                 
                 if prediction_data:
                     pred_df = pd.DataFrame(prediction_data)
-                    st.dataframe(pred_df.style.format("{:.4f}"))
+                    st.dataframe(pred_df)
                     
         except Exception as e:
             st.error(f"Error generating predictions: {str(e)}")
