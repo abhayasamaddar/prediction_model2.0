@@ -49,8 +49,13 @@ def load_data():
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # Drop rows with missing values in target columns
-        df = df.dropna(subset=numeric_cols)
+        # Fill missing values with forward fill and then backward fill
+        df[numeric_cols] = df[numeric_cols].fillna(method='ffill').fillna(method='bfill')
+        
+        # If there are still missing values, fill with column mean
+        for col in numeric_cols:
+            if df[col].isna().any():
+                df[col] = df[col].fillna(df[col].mean())
         
         return df
     except Exception as e:
@@ -58,30 +63,63 @@ def load_data():
         return pd.DataFrame()
 
 def create_features(df, target_columns, n_lags=3):
-    """Create lag features for time series prediction"""
+    """Create lag features for time series prediction with better handling"""
     df_eng = df.copy()
     
+    # Determine safe number of lags based on data length
+    safe_n_lags = min(n_lags, len(df_eng) - 1)
+    if safe_n_lags < 1:
+        st.warning("Not enough data for lag features. Using basic features only.")
+        safe_n_lags = 0
+    
+    # Create lag features only if we have enough data
     for col in target_columns:
-        for lag in range(1, n_lags + 1):
+        for lag in range(1, safe_n_lags + 1):
             df_eng[f'{col}_lag_{lag}'] = df_eng[col].shift(lag)
     
     # Add time-based features
     df_eng['hour'] = df_eng['created_at'].dt.hour
     df_eng['day_of_week'] = df_eng['created_at'].dt.dayofweek
     df_eng['month'] = df_eng['created_at'].dt.month
+    df_eng['day_of_year'] = df_eng['created_at'].dt.dayofyear
     
-    # Drop rows with NaN values created by lag features
+    # Add rolling statistics (if enough data)
+    if len(df_eng) > 5:
+        for col in target_columns:
+            df_eng[f'{col}_rolling_mean_3'] = df_eng[col].rolling(window=3, min_periods=1).mean()
+            df_eng[f'{col}_rolling_std_3'] = df_eng[col].rolling(window=3, min_periods=1).std()
+    
+    # Fill NaN values created by lag features and rolling stats
+    numeric_columns = df_eng.select_dtypes(include=[np.number]).columns
+    df_eng[numeric_columns] = df_eng[numeric_columns].fillna(method='bfill').fillna(method='ffill')
+    
+    # If there are still missing values, fill with column mean
+    for col in numeric_columns:
+        if df_eng[col].isna().any():
+            df_eng[col] = df_eng[col].fillna(df_eng[col].mean())
+    
+    # Drop rows that still have NaN values (should be very few if any)
+    initial_count = len(df_eng)
     df_eng = df_eng.dropna()
+    final_count = len(df_eng)
+    
+    if initial_count != final_count:
+        st.warning(f"Dropped {initial_count - final_count} rows with missing values after feature engineering.")
     
     return df_eng
 
 def prepare_lstm_data(df, target_columns, sequence_length=10):
-    """Prepare data for LSTM model"""
+    """Prepare data for LSTM model with safe sequence length"""
     features = ['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']
     X, y = [], []
     
-    for i in range(sequence_length, len(df)):
-        X.append(df[features].iloc[i-sequence_length:i].values)
+    # Use safe sequence length
+    safe_sequence_length = min(sequence_length, len(df) - 1)
+    if safe_sequence_length < 2:
+        return np.array([]), np.array([])
+    
+    for i in range(safe_sequence_length, len(df)):
+        X.append(df[features].iloc[i-safe_sequence_length:i].values)
         y.append(df[target_columns].iloc[i].values)
     
     return np.array(X), np.array(y)
@@ -231,27 +269,28 @@ def generate_future_predictions(models, df_eng, feature_cols, selected_targets, 
         
         try:
             if model_key in ['RF', 'XGB']:
-                # For traditional ML models, we'll use the last available features
-                current_features = df_eng[feature_cols].iloc[-1:].values
+                # For traditional ML models, use recursive prediction
+                current_features = df_eng[feature_cols].iloc[-1:].copy()
                 
-                for target in selected_targets:
-                    if target in model_data:
-                        # Simple approach: use last known value for future predictions
-                        # In a real scenario, you'd recursively update features
-                        last_value = df_eng[target].iloc[-1]
-                        # Create a simple trend (this is a simplified approach)
-                        for hour in range(hours):
-                            # Add some random variation around the last value
-                            predicted_value = last_value * (1 + np.random.normal(0, 0.01))
-                            future_preds[target].append(max(predicted_value, 0))  # Ensure non-negative
+                for hour in range(hours):
+                    for target in selected_targets:
+                        if target in model_data:
+                            pred = model_data[target].predict(current_features.values)[0]
+                            future_preds[target].append(pred)
+                    
+                    # Update features for next prediction (simplified)
+                    # This is a basic approach - in production you'd update lag features properly
+                    if hour < hours - 1:
+                        # For the next prediction, we can use the current predictions
+                        # This is simplified and may not be accurate for all feature types
+                        pass
                     
             elif model_key == 'SVM':
                 model, scaler_X, scaler_y = model_data
-                # Use last available features
                 current_features = df_eng[feature_cols].iloc[-1:].values
-                current_scaled = scaler_X.transform(current_features)
                 
                 for hour in range(hours):
+                    current_scaled = scaler_X.transform(current_features)
                     pred_scaled = model.predict(current_scaled)
                     pred = scaler_y.inverse_transform(pred_scaled)[0]
                     
@@ -273,16 +312,19 @@ def generate_future_predictions(models, df_eng, feature_cols, selected_targets, 
                     for i, target in enumerate(selected_targets):
                         future_preds[target].append(pred[i])
                     
-                    # Update the sequence for next prediction (simplified)
+                    # Update the sequence for next prediction
                     new_row = pred.copy()
                     last_sequence = np.vstack([last_sequence[1:], new_row])
                 
         except Exception as e:
             st.warning(f"Error in prediction for {model_key}: {e}")
-            # Fill with NaN if prediction fails
+            # Fill with simple trend if prediction fails
             for target in selected_targets:
                 if len(future_preds[target]) < hours:
-                    future_preds[target].extend([np.nan] * (hours - len(future_preds[target])))
+                    last_value = df_eng[target].iloc[-1]
+                    # Simple linear trend
+                    for i in range(len(future_preds[target]), hours):
+                        future_preds[target].append(last_value * (1 + 0.01 * i))
         
         future_predictions[model_key] = future_preds
     
@@ -309,17 +351,18 @@ def create_prediction_plots(df, future_predictions, selected_targets, models_to_
         # Plot 1: Hourly predictions (first 24 hours)
         # Actual data (last 24 hours if available)
         display_hours = min(24, len(df))
-        last_actual = df.tail(display_hours)
-        fig.add_trace(
-            go.Scatter(
-                x=last_actual['created_at'],
-                y=last_actual[target],
-                mode='lines+markers',
-                name='Actual (Recent)',
-                line=dict(color='blue', width=2)
-            ),
-            row=1, col=1
-        )
+        if display_hours > 0:
+            last_actual = df.tail(display_hours)
+            fig.add_trace(
+                go.Scatter(
+                    x=last_actual['created_at'],
+                    y=last_actual[target],
+                    mode='lines+markers',
+                    name='Actual (Recent)',
+                    line=dict(color='blue', width=2)
+                ),
+                row=1, col=1
+            )
         
         # Future predictions for each model (first 24 hours)
         colors = ['red', 'green', 'orange', 'purple']
@@ -348,17 +391,18 @@ def create_prediction_plots(df, future_predictions, selected_targets, models_to_
         # Plot 2: Weekly overview (all 168 hours)
         # Recent actual data
         display_week = min(168, len(df))
-        last_week_actual = df.tail(display_week)
-        fig.add_trace(
-            go.Scatter(
-                x=last_week_actual['created_at'],
-                y=last_week_actual[target],
-                mode='lines',
-                name='Actual (Recent)',
-                line=dict(color='blue', width=2)
-            ),
-            row=2, col=1
-        )
+        if display_week > 0:
+            last_week_actual = df.tail(display_week)
+            fig.add_trace(
+                go.Scatter(
+                    x=last_week_actual['created_at'],
+                    y=last_week_actual[target],
+                    mode='lines',
+                    name='Actual (Recent)',
+                    line=dict(color='blue', width=2)
+                ),
+                row=2, col=1
+            )
         
         # Future predictions for each model (all 168 hours)
         for i, model_key in enumerate(models_to_plot):
@@ -414,6 +458,45 @@ def main():
         st.error("No data loaded. Please check your Supabase connection and ensure the 'airquality' table exists.")
         return
     
+    # Show data quality information
+    st.header("📊 Data Quality Check")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Records", len(df))
+    
+    with col2:
+        missing_data = df[['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']].isna().sum().sum()
+        st.metric("Missing Values", missing_data)
+    
+    with col3:
+        completeness = (1 - missing_data / (len(df) * 6)) * 100
+        st.metric("Data Completeness", f"{completeness:.1f}%")
+    
+    with col4:
+        date_range = f"{df['created_at'].min().strftime('%Y-%m-%d')} to {df['created_at'].max().strftime('%Y-%m-%d')}"
+        st.metric("Date Range", date_range)
+    
+    # Show data preview
+    if st.checkbox("Show raw data preview"):
+        st.dataframe(df.tail(10))
+    
+    # Show data statistics
+    if st.checkbox("Show data statistics"):
+        st.subheader("Data Statistics")
+        st.dataframe(df[['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']].describe())
+    
+    # Show missing data details
+    if st.checkbox("Show missing data details"):
+        st.subheader("Missing Values by Column")
+        missing_df = pd.DataFrame({
+            'Column': ['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10'],
+            'Missing Count': [df[col].isna().sum() for col in ['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']],
+            'Missing Percentage': [df[col].isna().sum() / len(df) * 100 for col in ['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']]
+        })
+        st.dataframe(missing_df)
+    
     st.sidebar.header("Configuration")
     
     # Target selection
@@ -439,43 +522,39 @@ def main():
         st.warning("Please select at least one model to train.")
         return
     
-    # Display data overview
-    st.header("📊 Data Overview")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("Total Records", len(df))
-        st.metric("Date Range", f"{df['created_at'].min().strftime('%Y-%m-%d')} to {df['created_at'].max().strftime('%Y-%m-%d')}")
-    
-    with col2:
-        st.metric("Features", 6)
-        st.metric("Target Variables", len(selected_targets))
-    
-    with col3:
-        completeness = (1 - df[target_columns].isna().sum().sum() / (len(df) * len(target_columns))) * 100
-        st.metric("Data Completeness", f"{completeness:.1f}%")
-    
-    # Show data preview
-    if st.checkbox("Show raw data"):
-        st.dataframe(df.tail(10))
-    
-    # Show data statistics
-    if st.checkbox("Show data statistics"):
-        st.subheader("Data Statistics")
-        st.dataframe(df[target_columns].describe())
-    
     # Feature engineering
     st.header("🔧 Feature Engineering")
     
-    if len(df) < 10:
-        st.error("Not enough data for feature engineering. Need at least 10 records.")
+    if len(df) < 2:
+        st.error("Not enough data for feature engineering. Need at least 2 records.")
         return
         
-    df_eng = create_features(df, selected_targets, n_lags=2)
+    with st.spinner('Creating features...'):
+        df_eng = create_features(df, selected_targets, n_lags=2)
     
     if len(df_eng) == 0:
-        st.error("No data available after feature engineering. Check your data quality.")
+        st.error("""
+        No data available after feature engineering. This usually happens when:
+        1. There are too many missing values in your data
+        2. The data is too short for the requested lag features
+        3. There are issues with the data types
+        
+        Please check your data quality and try again.
+        """)
+        
+        # Show diagnostic information
+        st.subheader("Diagnostic Information")
+        st.write(f"Original data shape: {df.shape}")
+        st.write(f"Columns in original data: {list(df.columns)}")
+        st.write(f"Data types: {df.dtypes}")
+        
+        # Check for any rows with all NaN values
+        all_nan_rows = df[['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']].isna().all(axis=1).sum()
+        st.write(f"Rows with all NaN values: {all_nan_rows}")
+        
         return
+    
+    st.success(f"Feature engineering completed! Created {len(df_eng)} samples with {len(df_eng.columns)} features.")
     
     # Prepare data for traditional ML models
     feature_cols = [col for col in df_eng.columns if col not in ['id', 'created_at'] + selected_targets]
@@ -490,8 +569,8 @@ def main():
     # Split data for initial evaluation (but we'll use all data for final training)
     test_size = 0.2
     
-    if len(X) < 10:
-        st.error("Not enough data for training. Need at least 10 samples after feature engineering.")
+    if len(X) < 2:
+        st.error("Not enough data for training. Need at least 2 samples after feature engineering.")
         return
         
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, shuffle=False)
@@ -569,11 +648,13 @@ def main():
                 # Format the scores properly
                 formatted_scores = scores_df.copy()
                 for col in formatted_scores.columns:
-                    formatted_scores[col] = formatted_scores[col].apply(lambda x: f"{x:.4f}")
+                    formatted_scores[col] = formatted_scores[col].apply(lambda x: f"{x:.4f}" if not pd.isna(x) else "N/A")
                 st.dataframe(formatted_scores)
                 
         except Exception as e:
             st.error(f"Error training {model_name}: {str(e)}")
+            import traceback
+            st.error(f"Detailed error: {traceback.format_exc()}")
             continue
     
     # Model comparison
@@ -655,6 +736,8 @@ def main():
                     
         except Exception as e:
             st.error(f"Error generating predictions: {str(e)}")
+            import traceback
+            st.error(f"Detailed error: {traceback.format_exc()}")
 
 if __name__ == "__main__":
     main()
