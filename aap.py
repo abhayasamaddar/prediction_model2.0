@@ -1,0 +1,625 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from supabase import create_client
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import warnings
+warnings.filterwarnings('ignore')
+
+# Machine Learning imports
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+import xgboost as xgb
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from datetime import datetime, timedelta
+
+# Supabase configuration
+SUPABASE_URL = "https://fjfmgndbiespptmsnrff.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZqZm1nbmRiaWVzcHB0bXNucmZmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEyMzk0NzQsImV4cCI6MjA3NjgxNTQ3NH0.FH9L41cIKXH_mVbl7szkb_CDKoyKdw97gOUhDOYJFnQ"
+
+@st.cache_resource
+def init_supabase():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+@st.cache_data(ttl=300)
+def load_data():
+    try:
+        supabase = init_supabase()
+        response = supabase.table('airquality').select('*').execute()
+        
+        if not response.data:
+            st.error("No data found in the database.")
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(response.data)
+        
+        # Convert columns to appropriate data types
+        df['created_at'] = pd.to_datetime(df['created_at'])
+        df = df.sort_values('created_at')
+        
+        # Convert numeric columns
+        numeric_cols = ['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Drop rows with missing values in target columns
+        df = df.dropna(subset=numeric_cols)
+        
+        return df
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
+        return pd.DataFrame()
+
+def create_features(df, target_columns, n_lags=3):
+    """Create lag features for time series prediction"""
+    df_eng = df.copy()
+    
+    for col in target_columns:
+        for lag in range(1, n_lags + 1):
+            df_eng[f'{col}_lag_{lag}'] = df_eng[col].shift(lag)
+    
+    # Add time-based features
+    df_eng['hour'] = df_eng['created_at'].dt.hour
+    df_eng['day_of_week'] = df_eng['created_at'].dt.dayofweek
+    df_eng['month'] = df_eng['created_at'].dt.month
+    
+    # Drop rows with NaN values created by lag features
+    df_eng = df_eng.dropna()
+    
+    return df_eng
+
+def prepare_lstm_data(df, target_columns, sequence_length=10):
+    """Prepare data for LSTM model"""
+    features = ['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']
+    X, y = [], []
+    
+    for i in range(sequence_length, len(df)):
+        X.append(df[features].iloc[i-sequence_length:i].values)
+        y.append(df[target_columns].iloc[i].values)
+    
+    return np.array(X), np.array(y)
+
+def train_random_forest(X_train, X_test, y_train, y_test, target_columns):
+    """Train Random Forest model using all data"""
+    models = {}
+    predictions = {}
+    scores = {}
+    
+    # Use all data for training
+    X_all = np.vstack([X_train, X_test])
+    y_all = np.vstack([y_train, y_test])
+    
+    for i, col in enumerate(target_columns):
+        rf = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
+        rf.fit(X_all, y_all[:, i])
+        
+        # Predict on all data
+        pred = rf.predict(X_all)
+        
+        models[col] = rf
+        predictions[col] = pred
+        scores[col] = {
+            'rmse': np.sqrt(mean_squared_error(y_all[:, i], pred)),
+            'r2': r2_score(y_all[:, i], pred)
+        }
+    
+    return models, predictions, scores
+
+def train_xgboost(X_train, X_test, y_train, y_test, target_columns):
+    """Train XGBoost model using all data"""
+    models = {}
+    predictions = {}
+    scores = {}
+    
+    # Use all data for training
+    X_all = np.vstack([X_train, X_test])
+    y_all = np.vstack([y_train, y_test])
+    
+    for i, col in enumerate(target_columns):
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=50,
+            learning_rate=0.1,
+            random_state=42,
+            n_jobs=-1
+        )
+        xgb_model.fit(X_all, y_all[:, i])
+        
+        # Predict on all data
+        pred = xgb_model.predict(X_all)
+        
+        models[col] = xgb_model
+        predictions[col] = pred
+        scores[col] = {
+            'rmse': np.sqrt(mean_squared_error(y_all[:, i], pred)),
+            'r2': r2_score(y_all[:, i], pred)
+        }
+    
+    return models, predictions, scores
+
+def train_svm(X_train, X_test, y_train, y_test, target_columns):
+    """Train SVM model using all data"""
+    # Use all data for training
+    X_all = np.vstack([X_train, X_test])
+    y_all = np.vstack([y_train, y_test])
+    
+    # Scale the data for SVM
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+    
+    X_all_scaled = scaler_X.fit_transform(X_all)
+    y_all_scaled = scaler_y.fit_transform(y_all)
+    
+    # Use MultiOutputRegressor for multiple targets
+    svm_model = MultiOutputRegressor(SVR(kernel='rbf', C=1.0))
+    svm_model.fit(X_all_scaled, y_all_scaled)
+    
+    pred_scaled = svm_model.predict(X_all_scaled)
+    predictions = scaler_y.inverse_transform(pred_scaled)
+    
+    scores = {}
+    for i, col in enumerate(target_columns):
+        scores[col] = {
+            'rmse': np.sqrt(mean_squared_error(y_all[:, i], predictions[:, i])),
+            'r2': r2_score(y_all[:, i], predictions[:, i])
+        }
+    
+    return svm_model, predictions, scores, scaler_X, scaler_y
+
+def train_lstm(X_train, X_test, y_train, y_test, target_columns):
+    """Train LSTM model using all data"""
+    # Use all data for training
+    X_all = np.vstack([X_train, X_test])
+    y_all = np.vstack([y_train, y_test])
+    
+    # Scale the data
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+    
+    # Reshape for scaling
+    X_all_reshaped = X_all.reshape(-1, X_all.shape[2])
+    
+    X_all_scaled = scaler_X.fit_transform(X_all_reshaped).reshape(X_all.shape)
+    y_all_scaled = scaler_y.fit_transform(y_all)
+    
+    # Build LSTM model
+    model = Sequential([
+        LSTM(32, return_sequences=True, input_shape=(X_all.shape[1], X_all.shape[2])),
+        Dropout(0.2),
+        LSTM(32, return_sequences=False),
+        Dropout(0.2),
+        Dense(16),
+        Dense(len(target_columns))
+    ])
+    
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    
+    # Train model
+    history = model.fit(
+        X_all_scaled, y_all_scaled,
+        epochs=30,
+        batch_size=16,
+        validation_split=0.2,
+        verbose=0
+    )
+    
+    # Make predictions on all data
+    pred_scaled = model.predict(X_all_scaled, verbose=0)
+    predictions = scaler_y.inverse_transform(pred_scaled)
+    
+    scores = {}
+    for i, col in enumerate(target_columns):
+        scores[col] = {
+            'rmse': np.sqrt(mean_squared_error(y_all[:, i], predictions[:, i])),
+            'r2': r2_score(y_all[:, i], predictions[:, i])
+        }
+    
+    return model, predictions, scores, history, scaler_X, scaler_y
+
+def generate_future_predictions(models, df_eng, feature_cols, selected_targets, hours=168):  # 168 hours = 1 week
+    """Generate future predictions for the next hours"""
+    future_predictions = {}
+    
+    for model_key, model_data in models.items():
+        future_preds = {target: [] for target in selected_targets}
+        current_features = df_eng[feature_cols].iloc[-1:].copy()
+        
+        for hour in range(hours):
+            try:
+                if model_key in ['RF', 'XGB']:
+                    # Traditional ML models
+                    pred_values = {}
+                    for target in selected_targets:
+                        if target in model_data:
+                            pred = model_data[target].predict(current_features.values)[0]
+                            pred_values[target] = pred
+                            future_preds[target].append(pred)
+                    
+                    # Update features for next prediction (simplified approach)
+                    # In a real scenario, you'd update lag features properly
+                    
+                elif model_key == 'SVM':
+                    model, scaler_X, scaler_y = model_data
+                    current_scaled = scaler_X.transform(current_features.values)
+                    pred_scaled = model.predict(current_scaled)
+                    pred = scaler_y.inverse_transform(pred_scaled)[0]
+                    
+                    for i, target in enumerate(selected_targets):
+                        future_preds[target].append(pred[i])
+                    
+                elif model_key == 'LSTM':
+                    model, scaler_X, scaler_y = model_data
+                    # For LSTM, we need to maintain a sequence
+                    sequence_length = model.input_shape[1]
+                    # This is simplified - in practice you'd maintain proper sequences
+                    latest_data = df_eng[['temperature', 'humidity', 'co2', 'co', 'pm25', 'pm10']].tail(sequence_length).values
+                    sequence_scaled = scaler_X.transform(latest_data.reshape(-1, 6)).reshape(1, sequence_length, 6)
+                    pred_scaled = model.predict(sequence_scaled, verbose=0)
+                    pred = scaler_y.inverse_transform(pred_scaled)[0]
+                    
+                    for i, target in enumerate(selected_targets):
+                        future_preds[target].append(pred[i])
+                
+            except Exception as e:
+                st.warning(f"Error in prediction for {model_key} at hour {hour}: {e}")
+                for target in selected_targets:
+                    if len(future_preds[target]) <= hour:
+                        future_preds[target].append(np.nan)
+        
+        future_predictions[model_key] = future_preds
+    
+    return future_predictions
+
+def create_prediction_plots(df, future_predictions, selected_targets, models_to_plot):
+    """Create hourly and weekly prediction plots"""
+    
+    # Generate future timestamps
+    last_timestamp = df['created_at'].iloc[-1]
+    future_hours = len(list(future_predictions.values())[0][selected_targets[0]])
+    future_timestamps = [last_timestamp + timedelta(hours=i) for i in range(1, future_hours + 1)]
+    
+    plots = {}
+    
+    for target in selected_targets:
+        # Create subplots for actual vs predicted
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=(f'Hourly Predictions - {target}', f'Weekly Overview - {target}'),
+            vertical_spacing=0.1
+        )
+        
+        # Plot 1: Hourly predictions (first 24 hours)
+        # Actual data (last 24 hours)
+        last_24h = df.tail(24)
+        fig.add_trace(
+            go.Scatter(
+                x=last_24h['created_at'],
+                y=last_24h[target],
+                mode='lines+markers',
+                name='Actual (Last 24h)',
+                line=dict(color='blue', width=2)
+            ),
+            row=1, col=1
+        )
+        
+        # Future predictions for each model (first 24 hours)
+        colors = ['red', 'green', 'orange', 'purple']
+        for i, model_key in enumerate(models_to_plot):
+            if model_key in future_predictions:
+                pred_values = future_predictions[model_key][target][:24]
+                pred_timestamps = future_timestamps[:24]
+                
+                fig.add_trace(
+                    go.Scatter(
+                        x=pred_timestamps,
+                        y=pred_values,
+                        mode='lines+markers',
+                        name=f'Predicted {model_key}',
+                        line=dict(color=colors[i % len(colors)], width=2, dash='dash')
+                    ),
+                    row=1, col=1
+                )
+        
+        # Plot 2: Weekly overview (all 168 hours)
+        # Last week of actual data
+        last_week = df.tail(168)
+        fig.add_trace(
+            go.Scatter(
+                x=last_week['created_at'],
+                y=last_week[target],
+                mode='lines',
+                name='Actual (Last Week)',
+                line=dict(color='blue', width=2)
+            ),
+            row=2, col=1
+        )
+        
+        # Future predictions for each model (all 168 hours)
+        for i, model_key in enumerate(models_to_plot):
+            if model_key in future_predictions:
+                pred_values = future_predictions[model_key][target]
+                
+                fig.add_trace(
+                    go.Scatter(
+                        x=future_timestamps,
+                        y=pred_values,
+                        mode='lines',
+                        name=f'Predicted {model_key}',
+                        line=dict(color=colors[i % len(colors)], width=2, dash='dash')
+                    ),
+                    row=2, col=1
+                )
+        
+        fig.update_layout(
+            height=800,
+            title_text=f"Prediction Analysis for {target}",
+            showlegend=True
+        )
+        
+        fig.update_xaxes(title_text="Time", row=1, col=1)
+        fig.update_xaxes(title_text="Time", row=2, col=1)
+        fig.update_yaxes(title_text=target, row=1, col=1)
+        fig.update_yaxes(title_text=target, row=2, col=1)
+        
+        plots[target] = fig
+    
+    return plots
+
+def main():
+    st.set_page_config(page_title="Air Quality Prediction", layout="wide")
+    
+    st.title("🌤️ Air Quality Prediction Dashboard")
+    st.markdown("""
+    This app predicts future values of PM2.5, PM10, CO2, CO, Temperature, and Humidity using multiple machine learning models.
+    **All data is used for training** and continuous predictions are shown in hourly and weekly plots.
+    """)
+    
+    # Load data
+    with st.spinner('Loading data from Supabase...'):
+        df = load_data()
+    
+    if df.empty:
+        st.error("No data loaded. Please check your Supabase connection and ensure the 'airquality' table exists.")
+        return
+    
+    st.sidebar.header("Configuration")
+    
+    # Target selection
+    target_columns = ['pm25', 'pm10', 'co2', 'co', 'temperature', 'humidity']
+    selected_targets = st.sidebar.multiselect(
+        "Select targets to predict:",
+        target_columns,
+        default=target_columns
+    )
+    
+    if not selected_targets:
+        st.warning("Please select at least one target variable to predict.")
+        return
+    
+    # Model selection
+    models_to_train = st.sidebar.multiselect(
+        "Select models to train:",
+        ['Random Forest', 'XGBoost', 'SVM', 'LSTM'],
+        default=['Random Forest', 'XGBoost']
+    )
+    
+    if not models_to_train:
+        st.warning("Please select at least one model to train.")
+        return
+    
+    # Display data overview
+    st.header("📊 Data Overview")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("Total Records", len(df))
+        st.metric("Date Range", f"{df['created_at'].min().strftime('%Y-%m-%d')} to {df['created_at'].max().strftime('%Y-%m-%d')}")
+    
+    with col2:
+        st.metric("Features", 6)
+        st.metric("Target Variables", len(selected_targets))
+    
+    with col3:
+        completeness = (1 - df[target_columns].isna().sum().sum() / (len(df) * len(target_columns))) * 100
+        st.metric("Data Completeness", f"{completeness:.1f}%")
+    
+    # Show data preview
+    if st.checkbox("Show raw data"):
+        st.dataframe(df.tail(10))
+    
+    # Show data statistics
+    if st.checkbox("Show data statistics"):
+        st.subheader("Data Statistics")
+        st.dataframe(df[target_columns].describe())
+    
+    # Feature engineering
+    st.header("🔧 Feature Engineering")
+    
+    if len(df) < 10:
+        st.error("Not enough data for feature engineering. Need at least 10 records.")
+        return
+        
+    df_eng = create_features(df, selected_targets, n_lags=2)
+    
+    if len(df_eng) == 0:
+        st.error("No data available after feature engineering. Check your data quality.")
+        return
+    
+    # Prepare data for traditional ML models
+    feature_cols = [col for col in df_eng.columns if col not in ['id', 'created_at'] + selected_targets]
+    
+    if not feature_cols:
+        st.error("No features generated. Check your data.")
+        return
+        
+    X = df_eng[feature_cols].values
+    y = df_eng[selected_targets].values
+    
+    # Split data for initial evaluation (but we'll use all data for final training)
+    test_size = 0.2
+    
+    if len(X) < 10:
+        st.error("Not enough data for training. Need at least 10 samples after feature engineering.")
+        return
+        
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, shuffle=False)
+    
+    # Model training section
+    st.header("🤖 Model Training & Evaluation")
+    st.info("⚠️ All available data is used for training the models")
+    
+    all_models = {}
+    all_predictions = {}
+    all_scores = {}
+    
+    # Model name to key mapping
+    model_keys = {
+        'Random Forest': 'RF',
+        'XGBoost': 'XGB', 
+        'SVM': 'SVM',
+        'LSTM': 'LSTM'
+    }
+    
+    # Train selected models using all data
+    for model_name in models_to_train:
+        st.subheader(f"{model_name} Model")
+        model_key = model_keys[model_name]
+        
+        try:
+            with st.spinner(f'Training {model_name} with all data...'):
+                if model_name == 'Random Forest':
+                    models, predictions, scores = train_random_forest(X_train, X_test, y_train, y_test, selected_targets)
+                    all_models[model_key] = models
+                    all_predictions[model_key] = predictions
+                    all_scores[model_key] = scores
+                    
+                elif model_name == 'XGBoost':
+                    models, predictions, scores = train_xgboost(X_train, X_test, y_train, y_test, selected_targets)
+                    all_models[model_key] = models
+                    all_predictions[model_key] = predictions
+                    all_scores[model_key] = scores
+                    
+                elif model_name == 'SVM':
+                    model, predictions, scores, scaler_X, scaler_y = train_svm(X_train, X_test, y_train, y_test, selected_targets)
+                    all_models[model_key] = (model, scaler_X, scaler_y)
+                    all_predictions[model_key] = {col: predictions[:, i] for i, col in enumerate(selected_targets)}
+                    all_scores[model_key] = scores
+                    
+                elif model_name == 'LSTM':
+                    # Prepare LSTM data
+                    sequence_length = min(5, len(df_eng) // 3)
+                    if sequence_length < 2:
+                        st.warning("Not enough data for LSTM. Skipping LSTM training.")
+                        continue
+                        
+                    X_lstm, y_lstm = prepare_lstm_data(df_eng, selected_targets, sequence_length)
+                    
+                    if len(X_lstm) == 0:
+                        st.warning("Not enough sequences for LSTM training. Skipping LSTM.")
+                        continue
+                    
+                    # Split LSTM data for initial setup
+                    split_idx = int(len(X_lstm) * (1 - test_size))
+                    X_train_lstm, X_test_lstm = X_lstm[:split_idx], X_lstm[split_idx:]
+                    y_train_lstm, y_test_lstm = y_lstm[:split_idx], y_lstm[split_idx:]
+                    
+                    model, predictions, scores, history, scaler_X, scaler_y = train_lstm(
+                        X_train_lstm, X_test_lstm, y_train_lstm, y_test_lstm, selected_targets
+                    )
+                    all_models[model_key] = (model, scaler_X, scaler_y)
+                    all_predictions[model_key] = {col: predictions[:, i] for i, col in enumerate(selected_targets)}
+                    all_scores[model_key] = scores
+            
+            # Display scores for this model
+            if model_key in all_scores:
+                scores_df = pd.DataFrame(all_scores[model_key]).T
+                scores_df.columns = ['RMSE', 'R² Score']
+                st.dataframe(scores_df.style.format({"RMSE": "{:.4f}", "R² Score": "{:.4f}"}))
+                
+        except Exception as e:
+            st.error(f"Error training {model_name}: {str(e)}")
+            continue
+    
+    # Model comparison
+    if len(all_scores) > 1:
+        st.header("📈 Model Comparison")
+        
+        # Create comparison chart
+        comparison_data = []
+        for model_key, scores_dict in all_scores.items():
+            for target in selected_targets:
+                if target in scores_dict:
+                    comparison_data.append({
+                        'Model': model_key,
+                        'Target': target,
+                        'RMSE': scores_dict[target]['rmse'],
+                        'R2_Score': scores_dict[target]['r2']
+                    })
+        
+        if comparison_data:
+            comparison_df = pd.DataFrame(comparison_data)
+            
+            # RMSE comparison
+            fig_rmse = go.Figure()
+            for model in comparison_df['Model'].unique():
+                model_data = comparison_df[comparison_df['Model'] == model]
+                fig_rmse.add_trace(go.Bar(
+                    name=model,
+                    x=model_data['Target'],
+                    y=model_data['RMSE']
+                ))
+            
+            fig_rmse.update_layout(
+                title="RMSE Comparison by Model and Target",
+                xaxis_title="Target Variable",
+                yaxis_title="RMSE",
+                barmode='group'
+            )
+            
+            st.plotly_chart(fig_rmse, use_container_width=True)
+    
+    # Future prediction with plots
+    st.header("🔮 Continuous Future Predictions")
+    
+    if st.button("Generate Future Predictions") and all_models:
+        try:
+            with st.spinner('Generating future predictions...'):
+                # Generate predictions for the next 168 hours (1 week)
+                future_predictions = generate_future_predictions(
+                    all_models, df_eng, feature_cols, selected_targets, hours=168
+                )
+                
+                # Create prediction plots
+                plots = create_prediction_plots(df, future_predictions, selected_targets, list(all_models.keys()))
+                
+                # Display plots
+                for target, fig in plots.items():
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Show prediction table for the next 24 hours
+                st.subheader("📋 Prediction Values for Next 24 Hours")
+                prediction_data = []
+                
+                for hour in range(24):
+                    hour_data = {'Hour': f"Hour {hour+1}"}
+                    for model_key in all_models.keys():
+                        if model_key in future_predictions:
+                            for target in selected_targets:
+                                hour_data[f"{model_key}_{target}"] = future_predictions[model_key][target][hour]
+                    prediction_data.append(hour_data)
+                
+                if prediction_data:
+                    pred_df = pd.DataFrame(prediction_data)
+                    st.dataframe(pred_df.style.format("{:.4f}"))
+                    
+        except Exception as e:
+            st.error(f"Error generating predictions: {str(e)}")
+
+if __name__ == "__main__":
+    main()
